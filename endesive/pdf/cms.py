@@ -14,11 +14,33 @@ from cryptography.x509 import ObjectIdentifier
 from pypdf import PdfReader, PdfWriter, generic as po
 
 from endesive import signer
-from endesive.exceptions import TimestampError
+from endesive.exceptions import SignerError, TimestampError
 from endesive.pdf.PyPDF2_annotate.annotations.signature import Signature
 from endesive.pdf.PyPDF2_annotate.config.appearance import Appearance
 from endesive.pdf.PyPDF2_annotate.config.location import Location
 from endesive.pdf.PyPDF2_annotate.util.geometry import identity
+
+SUBFILTER_ADBE = "/adbe.pkcs7.detached"
+SUBFILTER_CADES = "/ETSI.CAdES.detached"
+_SUBFILTERS = (SUBFILTER_ADBE, SUBFILTER_CADES)
+
+
+def _subfilter(udct: dict[str, Any]) -> str:
+    """SubFilter of a regular signature from ``udct["subfilter"]``.
+
+    ``ETSI.CAdES.detached`` is the PAdES baseline profile (ETSI EN 319 142-1);
+    it needs signed attributes (signing-certificate-v2), so ``attrs=False``
+    is rejected before anything gets signed.
+    """
+    value = udct.get("subfilter") or SUBFILTER_ADBE
+    value = "/" + str(value).lstrip("/")
+    if value not in _SUBFILTERS:
+        raise SignerError(
+            f"Unsupported SubFilter {value!r}; expected one of: {', '.join(_SUBFILTERS)}"
+        )
+    if value == SUBFILTER_CADES and udct.get("attrs", True) is False:
+        raise SignerError("ETSI.CAdES.detached requires signed attributes (attrs=False)")
+    return value
 
 
 def _b_(s: str | bytes) -> bytes:
@@ -414,6 +436,37 @@ class SignedData(PdfWriter):
         page0.update({po.NameObject("/Annots"): annots})
         self._objects[page0ref.idnum - 1] = page0
 
+    @staticmethod
+    def _ensure_esic(catalog) -> None:
+        """Declare the ETSI extension (/Extensions /ESIC) in the catalog."""
+        if "/Extensions" not in catalog:
+            extensions = po.DictionaryObject()
+        else:
+            extensions = catalog["/Extensions"]
+
+        if "/ESIC" not in extensions:
+            extensions.update(
+                {
+                    po.NameObject("/ESIC"): po.DictionaryObject(
+                        {
+                            po.NameObject("/BaseVersion"): po.NameObject("/1.7"),
+                            po.NameObject("/ExtensionLevel"): po.NumberObject(1),
+                        }
+                    )
+                }
+            )
+            catalog.update({po.NameObject("/Extensions"): extensions})
+        else:
+            esic = extensions["/ESIC"]
+            major, minor = esic["/BaseVersion"].lstrip("/").split(".")
+            if int(major) < 1 or int(minor) < 7:
+                esic.update(
+                    {
+                        po.NameObject("/BaseVersion"): po.NameObject("/1.7"),
+                        po.NameObject("/ExtensionLevel"): po.NumberObject(1),
+                    }
+                )
+
     def _makepdf(
         self,
         prev,
@@ -436,38 +489,12 @@ class SignedData(PdfWriter):
             self._objects.append(None)
 
         if params["mode"] == "timestamp":
-            # deal with extensions
-            if "/Extensions" not in catalog:
-                extensions = po.DictionaryObject()
-            else:
-                extensions = catalog["/Extensions"]
-
-            if "/ESIC" not in extensions:
-                extensions.update(
-                    {
-                        po.NameObject("/ESIC"): po.DictionaryObject(
-                            {
-                                po.NameObject("/BaseVersion"): po.NameObject("/1.7"),
-                                po.NameObject("/ExtensionLevel"): po.NumberObject(1),
-                            }
-                        )
-                    }
-                )
-                catalog.update({po.NameObject("/Extensions"): extensions})
-            else:
-                esic = extensions["/ESIC"]
-                major, minor = esic["/BaseVersion"].lstrip("/").split(".")
-                if int(major) < 1 or int(minor) < 7:
-                    esic.update(
-                        {
-                            po.NameObject("/BaseVersion"): po.NameObject("/1.7"),
-                            po.NameObject("/ExtensionLevel"): po.NumberObject(1),
-                        }
-                    )
-
-            SubFilter = po.NameObject("/ETSI.CAdES.detached")
+            # the final SubFilter (/ETSI.RFC3161) is set below
+            SubFilter = po.NameObject(SUBFILTER_CADES)
         else:
-            SubFilter = po.NameObject("/adbe.pkcs7.detached")
+            SubFilter = po.NameObject(_subfilter(udct))
+        if SubFilter == SUBFILTER_CADES:
+            self._ensure_esic(catalog)
 
         # obj12 is the digital signature
         obj12, obj12ref = self._make_signature(
@@ -723,6 +750,9 @@ class SignedData(PdfWriter):
         ocspoptions=None,
         use_signingdate=True,
     ):
+        if mode != "timestamp":
+            # fail before the key (HSM, PIN, TSA) is used
+            _subfilter(udct)
         startdata = len(datau)
 
         fi = io.BytesIO(datau)
@@ -1032,6 +1062,11 @@ def sign(
                                             wraptext=True, fontsize:12, textalign:'left', linespacing:1.2
             application: string         optional application name in advanced signature properties dialog in Acrobat Reader
             pss: boolen                 optional choosen signature scheme RSASSA-PSS (true) vs. PKCS1-v1_5 (false/default)
+            subfilter: string           default:adbe.pkcs7.detached - SubFilter of the signature dictionary
+                                                adbe.pkcs7.detached - PKCS#7 detached (Adobe)
+                                                ETSI.CAdES.detached - PAdES baseline (ETSI EN 319 142-1),
+                                                    adds /Extensions /ESIC to the catalog; requires
+                                                    signed attributes (attrs must not be False)
         key: cryptography.hazmat.backends.openssl.rsa._RSAPrivateKey - private key used to sign the document
         cert: cryptography.x509.Certificate - certificate associated with the key
         othercerts: list of cryptography.x509.Certificate to be saved with the signed document,

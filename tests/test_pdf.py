@@ -8,7 +8,9 @@ from unittest import mock
 
 import PIL.Image
 import pypdf
+from asn1crypto import cms as asn1cms
 from cryptography import x509
+from fake_tsa import FakeTSA
 from test_cert import (
     CA,
     ca_root_cert,
@@ -615,3 +617,91 @@ class PDFTests(unittest.TestCase):
         self.assertTrue(results[-1].signatureok)
         self.assertTrue(results[-1].hashok)
 
+
+    # PAdES baseline (ETSI EN 319 142-1): SubFilter /ETSI.CAdES.detached
+    # i rozszerzenie /ESIC w katalogu; bez opcji zostaje /adbe.pkcs7.detached.
+    _SUBFILTER_UDCT = {
+        'sigflags': 3,
+        'contact': 'mak@trisoft.com.pl',
+        'location': 'Szczecin',
+        'signingdate': '20180731082642+02\'00\'',
+        'reason': 'Dokument podpisany cyfrowo',
+    }
+
+    @staticmethod
+    def _signature_dictionaries(data: bytes) -> list:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        fields = reader.trailer['/Root']['/AcroForm']['/Fields']
+        return [f.get_object()['/V'].get_object() for f in fields]
+
+    def _sign_fixture(self, **udct):
+        p12 = CA().pk12_load(cert1_p12, '1234')
+        with open(fixture('pdf.pdf'), 'rb') as fh:
+            datau = fh.read()
+        dct = dict(self._SUBFILTER_UDCT, **udct)
+        return datau + pdf.cms.sign(datau, dct, p12[0], p12[1], p12[2], 'sha256')
+
+    def test_pdf_default_subfilter_is_adbe_pkcs7_detached(self):
+        data = self._sign_fixture()
+        (sig,) = self._signature_dictionaries(data)
+        self.assertEqual(sig['/SubFilter'], '/adbe.pkcs7.detached')
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        self.assertNotIn('/Extensions', reader.trailer['/Root'])
+
+    def test_pdf_etsi_cades_detached_subfilter(self):
+        data = self._sign_fixture(subfilter='ETSI.CAdES.detached')
+        (sig,) = self._signature_dictionaries(data)
+        self.assertEqual(sig['/SubFilter'], '/ETSI.CAdES.detached')
+        self.assertEqual(sig['/Type'], '/Sig')
+
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        esic = reader.trailer['/Root']['/Extensions']['/ESIC']
+        self.assertEqual(esic['/BaseVersion'], '/1.7')
+
+        # CAdES: signing-certificate-v2 obecny, signing-time nie (czas w /M)
+        signed_data = asn1cms.ContentInfo.load(bytes(sig['/Contents']))['content']
+        attrs = [a['type'].native for a in signed_data['signer_infos'][0]['signed_attrs']]
+        self.assertIn('signing_certificate_v2', attrs)
+        self.assertNotIn('signing_time', attrs)
+        self.assertIn('/M', sig)
+
+        with open(ca_root_cert, 'rb') as fh:
+            trusted_cert_pems = (fh.read(),)
+        result, _moredata = pdf.verify(data, trusted_cert_pems)
+        assert result.signatureok and result.hashok and result.certok
+
+    def test_pdf_etsi_cades_subfilter_accepts_leading_slash(self):
+        (sig,) = self._signature_dictionaries(self._sign_fixture(subfilter='/ETSI.CAdES.detached'))
+        self.assertEqual(sig['/SubFilter'], '/ETSI.CAdES.detached')
+
+    def test_pdf_unknown_subfilter_is_rejected(self):
+        with self.assertRaises(exceptions.SignerError):
+            self._sign_fixture(subfilter='adbe.x509.rsa_sha1')
+
+    def test_pdf_etsi_cades_requires_signed_attributes(self):
+        # błąd przed użyciem klucza (przy HSM: bez zbędnego PIN-u i podpisu)
+        with mock.patch('endesive.signer.sign') as sign, \
+                self.assertRaises(exceptions.SignerError):
+            self._sign_fixture(subfilter='ETSI.CAdES.detached', attrs=False)
+        sign.assert_not_called()
+
+    def test_pdf_etsi_cades_with_timestamp_is_pades_b_t(self):
+        tsa = FakeTSA()
+        with mock.patch('requests.post', side_effect=tsa.post):
+            p12 = CA().pk12_load(cert1_p12, '1234')
+            with open(fixture('pdf.pdf'), 'rb') as fh:
+                datau = fh.read()
+            dct = dict(self._SUBFILTER_UDCT, subfilter='ETSI.CAdES.detached')
+            data = datau + pdf.cms.sign(datau, dct, p12[0], p12[1], p12[2], 'sha256',
+                                        tspurl='http://tsa.example/tsp')
+        (sig,) = self._signature_dictionaries(data)
+        self.assertEqual(sig['/SubFilter'], '/ETSI.CAdES.detached')
+        signer_info = asn1cms.ContentInfo.load(bytes(sig['/Contents']))['content']['signer_infos'][0]
+        unsigned = [a['type'].native for a in signer_info['unsigned_attrs']]
+        self.assertIn('signature_time_stamp_token', unsigned)
+
+        with open(ca_root_cert, 'rb') as fh:
+            trusted_cert_pems = [fh.read(), tsa.root_pem]
+        result, _moredata = pdf.verify(data, trusted_cert_pems)
+        assert result.signatureok and result.hashok and result.certok
+        self.assertIs(result.tspok, True, result.tspmsg)

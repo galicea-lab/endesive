@@ -86,6 +86,9 @@ pdf_signature_meta = {
     "location": "HQ",
     "contact": "security@example.com",
     "signingdate": signing_date,
+    # optional: PAdES baseline (ETSI EN 319 142-1) instead of adbe.pkcs7.detached;
+    # add tspurl=... to cms.sign for PAdES B-T
+    "subfilter": "ETSI.CAdES.detached",
 }
 
 signature_block = cms.sign(
