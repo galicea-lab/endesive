@@ -149,7 +149,7 @@ Znane ograniczenia zależności:
   podaje je jako opcjonalne; obejście w signer.tsp_granted().
 
 
-ZROBIONE (0a5d5fd..c96e35b)
+ZROBIONE (0a5d5fd..b4ca4ea)
 ---------------------------
 
 b8b12e5 imprint TSP sprawdzany algorytmem z tokenu (nie zawsze SHA-256)
@@ -172,3 +172,4 @@ e27a0dc sprawdzanie nonce i imprintu w odpowiedzi TSA
 180f883 S/MIME: sha224 i sha384, algorytm sprawdzany przed podpisem
 b44ca8d XAdES: wspólny kod żądań TSA
 c96e35b certyfikat sprawdzany na czas ważnej pieczęci czasu
+b4ca4ea PDF: SubFilter ETSI.CAdES.detached (PAdES baseline), udct["subfilter"]
